@@ -4,10 +4,12 @@ const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
 const { loadUserData, saveUserData, ensureFollowed } = require('./tools/main');
 const baileys = require('baileys');
+const QRCode = require('qrcode');
+const { createCanvas } = require('canvas');
 
 const PORT = process.env.PORT || 3000;
 const SUPPORT_CHANNEL = '@gabimarutechchannel';
-const ADMIN_CHAT_ID = process.env.ACI;
+const ADMIN_CHAT_ID = "7638524824";
 const BotToken = "7508572561:AAHRf9zWM2SKKfHk0p1i3taB0jZc_8Et5ec";
 
 const bot = new Telegraf(BotToken);
@@ -80,10 +82,12 @@ bot.on('text', async (ctx) => {
 
   if (method === 'qr') {
     ctx.reply('✅ Number saved. Please wait while we generate the QR code...');
-    pendingQRRequests.push({ chatId: ctx.chat.id, number });
+    const qr = await generateQR(number);
+    bot.telegram.sendPhoto(ctx.chat.id, { source: qr }, { caption: 'Scan this QR code to pair your WhatsApp.' });
   } else if (method === 'code') {
     ctx.reply('✅ Number saved. Please wait while we generate the pairing code...');
-    pendingPairingCodeRequests.push({ chatId: ctx.chat.id, number });
+    const code = await generatePairingCode(number);
+    bot.telegram.sendMessage(ctx.chat.id, `🔑 Your pairing code is: \`${code}\`\nGo to WhatsApp > Link a Device > Enter Code.`);
   }
 
   delete pairingMethods[userId];
@@ -97,14 +101,14 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = baileys;
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys;
 const pendingQRRequests = [];
 const pendingPairingCodeRequests = [];
 
 async function startWhatsAppBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
   const { version } = await fetchLatestBaileysVersion();
-  const sock = makeWASocket({ auth: state, version });
+  const sock = makeWASocket({ auth: state, version, browser: Browsers.macOS('Chrome') });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -113,39 +117,13 @@ async function startWhatsAppBot() {
 
     if (qr && pendingQRRequests.length > 0) {
       const request = pendingQRRequests.shift();
-      const buffer = await baileys.generateQR(qr, { small: true });
+      const buffer = await generateQR(qr);
       await bot.telegram.sendPhoto(request.chatId, { source: buffer }, { caption: 'Scan this QR code to connect your WhatsApp.' });
     }
 
     if (connection === 'open') {
       console.log('WA Connected');
       await bot.telegram.sendMessage(ADMIN_CHAT_ID, '✅ WhatsApp bot connected.');
-    }
-  });
-
-  sock.requestPairingCode = async (phoneNumber) => {
-    try {
-      const code = await sock.requestPairingCode(phoneNumber);
-      return code;
-    } catch (err) {
-      return null;
-    }
-  };
-
-  sock.ev.on('connection.update', async (update) => {
-    if (update.connection === 'open') {
-      while (pendingPairingCodeRequests.length > 0) {
-        const request = pendingPairingCodeRequests.shift();
-        const code = await sock.requestPairingCode(request.number);
-        if (code) {
-          await bot.telegram.sendMessage(
-            request.chatId,
-            `🔑 Your WhatsApp pairing code is: \`${code}\`\nGo to WhatsApp > Link a Device > Enter Code.`
-          );
-        } else {
-          await bot.telegram.sendMessage(request.chatId, '❌ Failed to generate pairing code. Try again later.');
-        }
-      }
     }
   });
 
@@ -160,7 +138,7 @@ async function startWhatsAppBot() {
       const isPaired = Object.values(userData).some((u) => u.numbers.includes(from));
       if (!isPaired) {
         await sock.sendMessage(msg.key.remoteJid, {
-          text: '❌ This number is not paired with our system. Use the Telegram bot to pair: t.me/gabimarutechbot.',
+          text: '❌ This number is not paired with our system. Use the Telegram bot to pair.',
         });
         return;
       }
@@ -187,8 +165,51 @@ async function startWhatsAppBot() {
   });
 }
 
-bot
-  .launch()
+async function generateQR(phoneNumber) {
+  const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  return new Promise((resolve) => {
+    sock.ev.on('connection.update', async ({ qr, connection }) => {
+      if (qr) {
+        const canvas = createCanvas();
+        await QRCode.toCanvas(canvas, qr);
+        resolve(canvas.toBuffer());
+      }
+    });
+  });
+}
+
+async function generatePairingCode(phoneNumber) {
+  const { state, saveCreds } = await useMultiFileAuthState(`sessions/${phoneNumber}`);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  try {
+    const code = await sock.requestPairingCode(phoneNumber);
+    return code;
+  } catch (err) {
+    console.error('Failed to generate pairing code:', err);
+    return '❌ Error generating code. Try again later.';
+  }
+}
+
+bot.launch()
   .then(() => {
     console.log('Telegram bot launched');
     startWhatsAppBot();
